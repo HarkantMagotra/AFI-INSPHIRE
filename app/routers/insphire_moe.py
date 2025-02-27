@@ -10,6 +10,8 @@ router = APIRouter()
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource('dynamodb')
 
+
+
 processed_table = dynamodb.Table("Test_Insphire_Processed")
 error_log_table = dynamodb.Table("Test_Insphire_ErrorLog")
 
@@ -48,6 +50,7 @@ if secrets:
     MOENGAGE_EVENT_API_URL_Test = secrets.get("MOENGAGE_EVENT_API_URL_Test", "")
     INSPIRE_BASE_URL = secrets.get("INSPIRE_BASE_URL", "")
     moe_token_test = secrets.get("moe_token_test", "")
+    FIXED_API_KEY = secrets.get("INSPHIRE_API_KEY", "")
 else:
     error_message = "Secrets Manager values missing or invalid"
     log_error_to_dynamodb("get_secret", error_message, {})
@@ -112,13 +115,15 @@ async def fetch_analysis_code(item_no: str, session_id: str, client):
 
 async def fetch_contract_details(contno: str, session_id: str):
     """Fetch contract details asynchronously with error handling."""
-    url = f"{INSPIRE_BASE_URL}/contracts?api_key={session_id}&$filter=CONTNO eq '{contno}'&fields=ORDBYEMAIL,TOTAL,DELPCODE,CONTNO"
+    url = f"{INSPIRE_BASE_URL}/contracts?api_key={session_id}&$filter=CONTNO eq '{contno}'&fields=ORDBYEMAIL,TOTAL,DELPCODE,CONTNO,CONTDATE"
 
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url)
             response.raise_for_status()
             contract_details = response.json()
+            if not contract_details:  # Handle empty response
+                return []
             return contract_details[0] if isinstance(contract_details, list) else contract_details
         except httpx.HTTPStatusError as e:
             error_message = f"HTTP Error: {e.response.status_code} while fetching contract details for {contno}"
@@ -128,6 +133,73 @@ async def fetch_contract_details(contno: str, session_id: str):
             error_message = f"Request failed: {str(e)}"
             log_error_to_dynamodb("fetch_contract_details", error_message, {"contno": contno})
             raise HTTPException(status_code=500, detail="Failed to fetch contract details")
+
+
+async def fetch_invoice_details(contno: str, session_id: str):
+    """Fetch invoice details asynchronously with error handling."""
+    url = f"{INSPIRE_BASE_URL}/invoices?api_key={session_id}&$filter=CONTNO eq '{contno}'&fields=GOODS"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            invoice_details = response.json()
+            if not invoice_details:  # Handle empty response
+                return []
+            return invoice_details[0] if isinstance(invoice_details, list) else invoice_details
+        except httpx.HTTPStatusError as e:
+            error_message = f"HTTP Error: {e.response.status_code} while fetching invoice details for {contno}"
+            log_error_to_dynamodb("fetch_invoice_details", error_message, {"contno": contno})
+            raise HTTPException(status_code=e.response.status_code, detail="Invoice details not found")
+        except httpx.RequestError as e:
+            error_message = f"Request failed: {str(e)}"
+            log_error_to_dynamodb("fetch_invoice_details", error_message, {"contno": contno})
+            raise HTTPException(status_code=500, detail="Failed to fetch invoice details")
+
+
+async def fetch_delivery_charges(contno: str, session_id: str):
+    """Fetch delivery charges asynchronously with error handling."""
+    url = f"{INSPIRE_BASE_URL}/deliverycharges?api_key={session_id}&$filter=CONTNO eq '{contno}'&fields=METHOD"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            delivery_charges = response.json()
+            if not delivery_charges:  # Handle empty response
+                return []
+            return delivery_charges[0] if isinstance(delivery_charges, list) else delivery_charges
+        except httpx.HTTPStatusError as e:
+            error_message = f"HTTP Error: {e.response.status_code} while fetching delivery charges for {contno}"
+            log_error_to_dynamodb("fetch_delivery_charges", error_message, {"contno": contno})
+            raise HTTPException(status_code=e.response.status_code, detail="Delivery charges not found")
+        except httpx.RequestError as e:
+            error_message = f"Request failed: {str(e)}"
+            log_error_to_dynamodb("fetch_delivery_charges", error_message, {"contno": contno})
+            raise HTTPException(status_code=500, detail="Failed to fetch delivery charges")
+
+
+
+async def fetch_contract_notes(contno: str, session_id: str):
+    """Fetch contract notes asynchronously with error handling."""
+    url = f"{INSPIRE_BASE_URL}/contractnotes?api_key={session_id}&$filter=CONTNO eq '{contno}'&fields=MEMO"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            contract_notes = response.json()
+            if not contract_notes:  # Handle empty response
+                return []
+            return contract_notes[0] if isinstance(contract_notes, list) else contract_notes
+        except httpx.HTTPStatusError as e:
+            error_message = f"HTTP Error: {e.response.status_code} while fetching contract notes for {contno}"
+            log_error_to_dynamodb("fetch_contract_notes", error_message, {"contno": contno})
+            raise HTTPException(status_code=e.response.status_code, detail="Contract notes not found")
+        except httpx.RequestError as e:
+            error_message = f"Request failed: {str(e)}"
+            log_error_to_dynamodb("fetch_contract_notes", error_message, {"contno": contno})
+            raise HTTPException(status_code=500, detail="Failed to fetch contract notes")
 
 
 
@@ -171,23 +243,78 @@ async def send_to_moengage(customer_id: str, event: str, attributes: dict):
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         error_message = f"MoEngage API error: {str(e)}"
         log_error_to_dynamodb(customer_id, error_message, payload)
+        print(f"Logging failed event for {customer_id} to SQS...")
+        await send_to_sqs(payload)
         raise HTTPException(status_code=500, detail=error_message)  # Standardized error handling
 
     except Exception as e:
         error_message = f"Unexpected error in send_to_moengage: {str(e)}"
         log_error_to_dynamodb(customer_id, error_message, payload)
+        await send_to_sqs(payload)
         raise HTTPException(status_code=500, detail=error_message)
 
-@router.get("/fetch_contract_data/")
-async def fetch_contract_data(contno: str, event: str):
+
+@router.post("/SQS")
+async def send_to_sqs(failed_payload: dict):
+    """Send failed MoEngage payload to AWS SQS for retrying."""
+
+    sqs = boto3.client('sqs', region_name="eu-north-1")  
+    SQS_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/062314917923/MoEngageInsphireRetryQueue" 
+    
+    try:
+        response = sqs.send_message(
+            QueueUrl=SQS_QUEUE_URL,
+            MessageBody=json.dumps(failed_payload)
+        )
+        print(f"Failed payload sent to SQS: {response['MessageId']}")
+    except Exception as e:
+        error_message = f"Error sending failed payload to SQS: {str(e)}"
+        log_error_to_dynamodb(failed_payload.get("customer_id", "unknown"), error_message, failed_payload)
+        print("SQS send failed, logging in DynamoDB.")
+
+
+
+def validate_api_key(apikey: str, email: str = None):
+    """Validate API key"""
+    try:
+        if apikey != FIXED_API_KEY:
+            # Log the error to DynamoDB
+            log_error_to_dynamodb(email=email, error_message="Wrong API key", payload={"received_api_key": apikey})
+            # Raise HTTPException with a 403 status for wrong API key
+            raise HTTPException(status_code=403, detail="Wrong API key")
+        
+    except HTTPException as e:
+        # If it's a known HTTP error (like wrong API key), just raise it and log to DynamoDB
+        log_error_to_dynamodb(email=email, error_message=f"HTTP error: {e.detail}", payload={"received_api_key": apikey})
+        raise e  # Re-raise the HTTPException
+    
+    except Exception as e:
+        # Log unexpected errors to DynamoDB
+        log_error_to_dynamodb(email=email, error_message="Unexpected error during API key validation", payload={"error": str(e)})
+        # Raise a generic HTTPException for internal server errors
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/sync")
+async def fetch_contract_data(contno: str, event: str, apikey: str):
 
     try:   
+        validate_api_key(apikey)
+
         session_id = get_session()
 
-        contract_items, contract_details = await asyncio.gather(
+        
+        #  , invoice_details   fetch_invoice_details(contno, session_id)
+
+        contract_items, contract_details, invoice_details, delivery_charges, contract_notes = await asyncio.gather(
             fetch_contract_items_and_codes(contno, session_id),
             fetch_contract_details(contno, session_id),
+            fetch_invoice_details(contno, session_id),
+            fetch_delivery_charges(contno, session_id),
+            fetch_contract_notes(contno, session_id)
         )
+
+        # print(invoice_details)
 
         if not contract_details:
             raise HTTPException(status_code=404, detail="No contract details found")
@@ -205,7 +332,8 @@ async def fetch_contract_data(contno: str, event: str):
                     'rate_code': item.get("RATECODE"),
                     'rate': item.get("RATE1"),
                     'total_value': contract_details.get("TOTAL"),
-                    'quote_date': item.get("HIREDATE"),
+                    'transport': delivery_charges.get("METHOD"),
+                    'quote_date': contract_details.get("CONTDATE"),
                     'hire_start_date': item.get("HIREDATE"),
                     'est_hire_end': item.get("ESTRETD"),
                     'depot': item.get("DEPOT"),
@@ -224,7 +352,8 @@ async def fetch_contract_data(contno: str, event: str):
                     'rate_code': item.get("RATECODE"),
                     'rate': item.get("RATE1"),
                     'total_value': contract_details.get("TOTAL"),
-                    'quote_date': item.get("HIREDATE"),
+                    'transport': delivery_charges.get("METHOD"),
+                    'quote_date': contract_details.get("CONTDATE"),
                     'hire_start_date': item.get("HIREDATE"),
                     'est_hire_end': contract_details.get("ESTRETD", ""),
                     'depot': item.get("DEPOT"),
@@ -242,11 +371,13 @@ async def fetch_contract_data(contno: str, event: str):
                     'rate_code': item.get("RATECODE"),
                     'rate': item.get("RATE1"),
                     'total_value': contract_details.get("TOTAL"),
-                    'quote_date': item.get("HIREDATE"),
+                    'transport': delivery_charges.get("METHOD"),
+                    'quote_date': contract_details.get("CONTDATE"),
                     'hire_start_date': item.get("HIREDATE"),
                     'est_hire_end': item.get("ESTRETD", ""),
                     'depot': item.get("DEPOT"),
-                    'postcode': contract_details.get("DELPCODE", "")
+                    'postcode': contract_details.get("DELPCODE", ""),
+                    'reason': contract_notes.get("MEMO", "")
                 })
 
         elif event == "Off Hire":
@@ -255,7 +386,7 @@ async def fetch_contract_data(contno: str, event: str):
                 'email': contract_details.get("ORDBYEMAIL", ""),
                 'item': contract_items[0].get("ITEMNO") if contract_items else "",
                 'analysis_code': contract_items[0].get("ANLCODE") if contract_items else "",
-                'date_of_off_hire': contract_details.get("DELPCODE", "")
+                'date_of_off_hire': contract_details.get("DELPCODE", ""),
             })
 
         elif event == "Invoice":
@@ -264,7 +395,9 @@ async def fetch_contract_data(contno: str, event: str):
                     'contract_number': item.get("CONTNO"),
                     'item': item.get("ITEMNO"),
                     'email': contract_details.get("ORDBYEMAIL", ""),
-                    'analysis_code': item.get("ANLCODE")
+                    'amount': invoice_details.get("GOODS"),
+                    'analysis_code': item.get("ANLCODE"),
+                    'transport': delivery_charges.get("METHOD"),
                 })
         else:
             raise HTTPException(status_code=400, detail="Invalid job type")
@@ -274,8 +407,10 @@ async def fetch_contract_data(contno: str, event: str):
 
         await send_to_moengage(response_data.get("email", ""), event, response_data)
 
+
         return response_data
     
     except Exception as e:
         log_error_to_dynamodb(response_data.get("email", ""), str(e), response_data)
         raise HTTPException(status_code=500, detail="Failed to fetch contract data")
+
